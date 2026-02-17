@@ -20,10 +20,10 @@ import scala.util.Try
 
 class OpenRouterClient(
   config: OpenAIConfig,
-  protected val metrics: org.llm4s.metrics.MetricsCollector = org.llm4s.metrics.MetricsCollector.noop
+  protected val metrics: org.llm4s.metrics.MetricsCollector = org.llm4s.metrics.MetricsCollector.noop,
+  httpClient: HttpClient = HttpClient.newHttpClient()
 ) extends LLMClient
     with MetricsRecording {
-  private val httpClient            = HttpClient.newHttpClient()
   private val closed: AtomicBoolean = new AtomicBoolean(false)
 
   override def complete(
@@ -82,58 +82,62 @@ class OpenRouterClient(
 
       val accumulator = StreamingAccumulator.create()
 
-      val attempt =
-        Try {
-          val request = HttpRequest
-            .newBuilder()
-            .uri(URI.create(s"${config.baseUrl}/chat/completions"))
-            .header("Content-Type", "application/json")
-            .header("Authorization", s"Bearer ${config.apiKey}")
-            .header("HTTP-Referer", "https://github.com/llm4s/llm4s")
-            .header("X-Title", "LLM4S")
-            .timeout(Duration.ofMinutes(5))
-            .POST(HttpRequest.BodyPublishers.ofString(requestBody.render()))
-            .build()
+      val request = HttpRequest
+        .newBuilder()
+        .uri(URI.create(s"${config.baseUrl}/chat/completions"))
+        .header("Content-Type", "application/json")
+        .header("Authorization", s"Bearer ${config.apiKey}")
+        .header("HTTP-Referer", "https://github.com/llm4s/llm4s")
+        .header("X-Title", "LLM4S")
+        .timeout(Duration.ofMinutes(5))
+        .POST(HttpRequest.BodyPublishers.ofString(requestBody.render()))
+        .build()
 
-          val response = httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream())
+      val attempt: Result[Unit] =
+        Try(httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream())).toEither.left
+          .map(_.toLLMError)
+          .flatMap { response =>
+            val stream = response.body()
 
-          if (response.statusCode() != 200) {
-            val errorBody = new String(response.body().readAllBytes(), StandardCharsets.UTF_8)
-            response.statusCode() match {
-              case 401 => throw new RuntimeException(AuthenticationError("openrouter", "Invalid API key").formatted)
-              case 429 => throw new RuntimeException(RateLimitError("openrouter").formatted)
-              case status =>
-                throw new RuntimeException(
-                  s"${ServiceError(status, "openrouter", s"OpenRouter API error: $errorBody").formatted}"
-                )
-            }
-          }
-
-          val sseParser = SSEParser.createStreamingParser()
-          val reader    = new BufferedReader(new InputStreamReader(response.body(), StandardCharsets.UTF_8))
-          val loopTry = Try {
-            var line: String = null
-            while ({ line = reader.readLine(); line != null }) {
-              sseParser.addChunk(line + "\n")
-              while (sseParser.hasEvents)
-                sseParser.nextEvent().foreach { event =>
-                  event.data.foreach { data =>
-                    if (data != "[DONE]") {
-                      val json   = ujson.read(data)
-                      val chunks = parseStreamingChunks(json)
-                      chunks.foreach { c =>
-                        accumulator.addChunk(c)
-                        onChunk(c)
+            if (response.statusCode() != 200) {
+              val errorBody = Try(new String(stream.readAllBytes(), StandardCharsets.UTF_8)).getOrElse("")
+              Try(stream.close())
+              response.statusCode() match {
+                case 401    => Left(AuthenticationError("openrouter", "Invalid API key"))
+                case 429    => Left(RateLimitError("openrouter"))
+                case status => Left(ServiceError(status, "openrouter", s"OpenRouter API error: $errorBody"))
+              }
+            } else {
+              val sseParser = SSEParser.createStreamingParser()
+              val reader    = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))
+              val loopTry = Try {
+                var line: String = null
+                while ({ line = reader.readLine(); line != null }) {
+                  sseParser.addChunk(line + "\n")
+                  while (sseParser.hasEvents)
+                    sseParser.nextEvent().foreach { event =>
+                      event.data.foreach { data =>
+                        if (data != "[DONE]") {
+                          val json   = ujson.read(data)
+                          val chunks = parseStreamingChunks(json)
+                          chunks.foreach { c =>
+                            accumulator.addChunk(c)
+                            onChunk(c)
+                          }
+                        }
                       }
                     }
-                  }
                 }
+              }
+
+              val closeTry = Try {
+                reader.close()
+                stream.close()
+              }
+
+              loopTry.toEither.left.map(_.toLLMError).flatMap(_ => closeTry.toEither.left.map(_.toLLMError))
             }
           }
-          Try(reader.close()); Try(response.body().close())
-          loopTry.get
-        }.toEither.left
-          .map(_.toLLMError)
 
       attempt.flatMap(_ => accumulator.toCompletion)
     }
